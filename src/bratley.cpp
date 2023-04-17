@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <climits>
 #include <algorithm>
+#include <functional>
 #define GREEN true
 #define RED false
 
@@ -19,7 +20,6 @@
 #define TOKEN_GREEN 1
 #define TOKEN_RED 2
 
-// const std::vector<unsigned int> correct_solution_id_sequence = {0, 26, 23, 25, 24, 22, 21, 20, 19, 17, 16, 12, 11, 9, 6, 14, 5, 7, 4, 15, 3, 1, 18, 13, 10, 8, 2};
 
 int tag_terminate =1;
 int tag_token =2;
@@ -38,9 +38,10 @@ typedef struct task_s {
         unsigned int duration;
         unsigned int release;
         unsigned int deadline;
+        unsigned int cost_lb;
         task_s(unsigned int id, unsigned int duration, unsigned int release, unsigned int deadline) :
-            id(id), duration(duration), release(release), deadline(deadline) {}
-        task_s() : id(0), duration(0), release(0), deadline(0) {}
+            id(id), duration(duration), release(release), deadline(deadline),cost_lb(release+duration) {}
+        task_s() : id(0), duration(0), release(0), deadline(0),cost_lb(0) {}
 } task_t;
 
 
@@ -48,16 +49,18 @@ MPI_Datatype mpi_task_type;
 
 void create_task_type()
 {
-    int          blocklengths[4] = {1,1,1,1};
-    MPI_Datatype types[4] = {MPI_UNSIGNED, MPI_UNSIGNED, MPI_UNSIGNED, MPI_UNSIGNED};
-    MPI_Aint     offsets[4];
+    const int nitems = 5;
+    int          blocklengths[nitems] = {1,1,1,1,1};
+    MPI_Datatype types[nitems] = {MPI_UNSIGNED, MPI_UNSIGNED,MPI_UNSIGNED, MPI_UNSIGNED, MPI_UNSIGNED};
+    MPI_Aint     offsets[nitems];
 
     offsets[0] = offsetof(task_t, id);
     offsets[1] = offsetof(task_t, duration);
     offsets[2] = offsetof(task_t, release);
     offsets[3] = offsetof(task_t, deadline);
+    offsets[4] = offsetof(task_t, cost_lb);
 
-    MPI_Type_create_struct(4, blocklengths, offsets, types, &mpi_task_type);
+    MPI_Type_create_struct(nitems, blocklengths, offsets, types, &mpi_task_type);
     MPI_Type_commit(&mpi_task_type);
 }
 
@@ -139,6 +142,28 @@ std::vector<task_t> readInstance(const std::string& instanceFileName) {
     return tasks;
 }
 
+unsigned int validate(const std::vector<task_t>& tasks)
+{
+    unsigned int max_deadline = 0;
+    unsigned int sum = 0;
+    for(const auto& t : tasks)
+    {
+        sum+=t.duration;
+        if(t.deadline > max_deadline)
+            max_deadline = t.deadline;
+
+        if(t.cost_lb > t.deadline)
+        {
+            return 0;
+        }
+    }
+
+    if(sum > max_deadline)
+        return 0;
+
+    return max_deadline;
+}
+
 void writeOutput(const std::string& outputFileName, const std::vector<unsigned int>& start_times) {
     std::ofstream file(outputFileName);
     if (file.is_open()) {
@@ -161,11 +186,12 @@ void distributeInitialData(std::vector<task_t> tasks, int UB)
     MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&UB, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    MPI_Bcast(tasks.data(), N, mpi_task_type, 0, MPI_COMM_WORLD);
+    if(N !=0)
+        MPI_Bcast(tasks.data(), N, mpi_task_type, 0, MPI_COMM_WORLD);
 }
 
 
-std::tuple<std::vector<task_t>, unsigned int>receiveInitialData()
+std::tuple<std::vector<task_t>, unsigned int> receiveInitialData()
 {
     int N = 0;
     int UB = 0;
@@ -174,9 +200,11 @@ std::tuple<std::vector<task_t>, unsigned int>receiveInitialData()
     MPI_Bcast(&UB, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     std::vector<task_t> tasks;
-    tasks.resize(N);
-
-    MPI_Bcast(tasks.data(), N, mpi_task_type, 0, MPI_COMM_WORLD);
+    if(N !=0)
+    {
+        tasks.resize(N);
+        MPI_Bcast(tasks.data(), N, mpi_task_type, 0, MPI_COMM_WORLD);
+    }
 
     return std::make_tuple(tasks, UB);
 }
@@ -412,17 +440,8 @@ public:
                 {
                     // std::cout << "waiting for data " << work_size << std::endl;
                     state = State::waiting_for_work_data;
-                    // work.resize(work_size);
                     work.resize(work_size);
                     MPI_Irecv(work.data(), work_size, mpi_task_node_type, requested_from, tag_response_work_data, MPI_COMM_WORLD, &r_recv_work);
-                    // std::cout << "after ircv" << std::endl;
-                    // MPI_Wait(&r_recv_work, MPI_STATUS_IGNORE);
-                    // std::cout << "after wait" << std::endl;
-                    // for(auto w : recv_work)
-                    // {
-                        // std::cout << w.id << " ";
-                    // }
-                    // std::cout << "" << std::endl;
                 }
             }
         }
@@ -533,16 +552,7 @@ public:
         parents_snd[sending_to] = std::vector(std::move(parents));
 
         MPI_Isend(&work_snd_size[sending_to], 1, MPI_INT, sending_to, tag_response_work_size, MPI_COMM_WORLD, r_send_work_size + sending_to);
-        // std::cout << "sleep before send " << work_snd_size[sending_to] << std::endl;
-
-        // for(auto w : work_snd[sending_to])
-        // {
-            // std::cout << w.id  <<" ";
-        // }
-        // std::cout << "" << std::endl;
-        // sleep(1);
         MPI_Isend(work_snd[sending_to].data(), work_snd_size[sending_to], mpi_task_node_type, sending_to, tag_response_work_data, MPI_COMM_WORLD, r_send_work + sending_to);
-        // sleep(1);
         MPI_Isend(&parents_snd_size[sending_to], 1, MPI_INT, sending_to, tag_response_parents_size, MPI_COMM_WORLD, r_send_parents_size + sending_to);
         MPI_Isend(parents_snd[sending_to].data(), parents_snd_size[sending_to], MPI_UNSIGNED, sending_to, tag_response_parents_data, MPI_COMM_WORLD, r_send_parents + sending_to);
 
@@ -678,10 +688,9 @@ public:
 
     bool check_missed_deadline() const
     {  
-        // for (size_t i = 0; i < N; i++)
         for(const auto& t : tasks)
         {
-            if(V.at(t.id) and ((c + t.duration > t.deadline) or (t.release + t.duration > t.deadline)))
+            if(V.at(t.id) and (c + t.duration > t.deadline))
             {
                 return true;
             }
@@ -766,48 +775,17 @@ public:
     }
 
     void perform_work() {
-        // std::cout << rank <<" perform, ws " << work.size() << " ts " <<  tasks.size() << " N " << N << " V: ";
-
-        // for(auto var : V)
-        // {
-            // std::cout << var << " ";
-        // }
-        // std::cout << "" << std::endl;
-
-
         const task_node_t tn = work.back();
         work.pop_back();
 
-        // bool parent_prefix_matches = false;
-        // bool parent_prefix_matches = true;
-
-        // for (size_t i = 0; i < parents.size(); i++)
-        // {
-            // if(parents[i] != correct_solution_id_sequence[i])
-                // parent_prefix_matches = false;
-        // }
-
-        // parent_prefix_matches = parent_prefix_matches and (correct_solution_id_sequence[parents.size()] == tn.id);
-
-        // if(parent_prefix_matches)
-        // {
-            // std::cout << "parent_prefix_matches " << parents.size() +1 << ": ";
-// 
-            // for(auto p : parents)
-            // {
-                // std::cout << p << " ";
-            // }
-            // std::cout << tn.id << std::endl;
-        // }
-        
-
         if(current_depth > tn.depth)
         {
-            // if((current_depth - tn.depth) >1)
-                // std::cout << rank << ": current_depth > tn.depth " << (current_depth - tn.depth)  << std::endl;
+            // if ((current_depth - tn.depth > 2))
+                // std::cout << " " << (current_depth - tn.depth) << " " << parents.size() << std::endl;
+            // if((current_depth - tn.depth) > parents.size())
+                // std::cout << "FAIL" << std::endl;
             for (unsigned int i = tn.depth; i < current_depth; i++) // must be always 1 ??
             {
-                // std::cout << "PARENTS SIZE " << parents.size() <<". POP " << std::endl;
                 V[parents.back()] = true;
                 parents.pop_back();
             }
@@ -815,9 +793,6 @@ public:
 
         current_depth = tn.depth;
         c = tn.cost;
-        // if(parent_prefix_matches)
-            // std::cout << rank << " pick node " << tn.id << ":" << tn.depth << ":" << tn.cost << std::endl;
-
 
         if(current_depth == N -1)
         {
@@ -843,8 +818,6 @@ public:
 
             if(check_missed_deadline() or check_violated_UB())
             {
-                // if(parent_prefix_matches)
-                    // std::cout << rank << " Violated. " << tn.id << ":" <<tn.depth << " "<< check_missed_deadline() << " " << check_violated_UB() << std::endl;
                 V[tn.id] = true;
                 return;
             }
@@ -853,48 +826,28 @@ public:
             {
                 last_no_backtrack_depth = tn.depth;
                 send_no_backtracking();
-                // std::cout << rank << " dropping " << work.size() << " work" << std::endl;
                 work.clear();
             }
 
-            // if(parent_prefix_matches)
-                // std::cout << " adding children: " ;
-
             // expand node 
-            // bool inserted_any = false;
+            bool inserted_any = false;
             for(const auto& t : tasks)
             {
                 if(V[t.id])
                 {
-                    // if(parent_prefix_matches)
-                        // std::cout << t.id << " ";
-                    // std::cout << rank <<" inserting " << t.id << std::endl;
                     work.emplace_back(t.id, (c > t.release? c: t.release) + t.duration, current_depth+1);
-                    // inserted_any = true;
+                    inserted_any = true;
                 }
             } 
-            // if(parent_prefix_matches)
-                // std::cout << "" << std::endl;
-
-            // if(parent_prefix_matches)
-            // {
-                // std::cout << "new work: " << std::endl;
-
-                // for(auto w : work)
-                // {
-                    // std::cout << w.id << ":" << w.depth << ":" << w.cost << " " ;
-                // }
-                // std::cout << "" << std::endl;
-            // }
-            // if(inserted_any)
-            // {
-            parents.push_back(tn.id);
-            // }
-            // else
-            // {
+            if(inserted_any)
+            {
+                parents.push_back(tn.id);
+            }
+            else
+            {
                 // std::cout << rank <<" inserted nothing" << std::endl;
                 //TODO: think: should not really happen
-            // }
+            }
         }
 
 
@@ -906,13 +859,58 @@ public:
         {
             if(work.size() >= 2 and work.front().depth <= SHARE_DEPTH_LIMIT)
             {
-                share_work();
+                // share_work();
+                share_half_work();
             }
             else {
                 channel_work_response.send_no_work();
             }
         }
     }
+
+    void share_half_work()
+    {
+        if( rank > channel_work_response.requester_id())
+            color = RED;
+
+        // decide how much work to share:
+        // share half of nodes of  depth above limit
+
+        std::vector<task_node_t> work_to_share;
+        work_to_share.reserve(work.size()/2);
+        std::deque<task_node_t> my_new_work;
+        // my_new_work.reserve(work.size());
+
+        bool is_odd=true;
+        for(const auto& tn : work)
+        {
+            if(is_odd and tn.depth <= SHARE_DEPTH_LIMIT)
+                work_to_share.push_back(std::move(tn));
+                // work_to_share.push_back(tn);
+            else
+                my_new_work.push_back(std::move(tn));
+                // my_new_work.push_back(tn);
+
+            // count++;
+            is_odd = !is_odd;
+        }
+        work=std::move(my_new_work);
+
+        const int depth_to_send = work_to_share.back().depth;
+        std::vector<unsigned int> parents_to_send;
+
+        if(depth_to_send > 0)
+        {
+            parents_to_send.reserve(depth_to_send);
+            for (size_t i = 0; i < depth_to_send; i++)
+            {
+                parents_to_send.push_back( parents[i] );
+            }
+        }
+       
+        channel_work_response.send_work(std::move(work_to_share), std::move(parents_to_send));
+    }
+
 
     void share_work()
     {
@@ -935,13 +933,8 @@ public:
         std::vector<task_node_t> work_to_share;
         work_to_share.reserve(shared_work_size);
 
-        // bool shared23 = false;//TODO: delete
         for (size_t i = 0; i < shared_work_size; i++)
         {
-            // if(work.front().id == 23 and work.front().depth == 2)
-            // {
-                // shared23=true;
-            // }
             work_to_share.push_back( work.front() );
             work.pop_front();
         }
@@ -956,27 +949,7 @@ public:
                 parents_to_send.push_back( parents[i] );
             }
         }
-        // std::cout << "sharing work " << shared_work_size << std::endl;
-        // if(shared23)
-        // {
-            // std::cout << "all work to share: " << std::endl;
-            // std::cout << "Sharing " << work.front().id << " " << work.front().depth << " " << work.front().cost << std::endl;
-
-            // for(auto w: work_to_share)
-            // {
-                // std::cout << w.id <<" " << w.depth<< " ";
-
-            // }
-            // std::cout << "" << std::endl;
-
-
-            // std::cout << "sharing 23 parents: "  << std::endl;
-            // for(auto p: parents_to_send )
-            // {
-                // std::cout << p << " ";
-            // }
-            // std::cout << "" << std::endl;
-        // }
+       
         channel_work_response.send_work(std::move(work_to_share), std::move(parents_to_send));
     }
         
@@ -1014,8 +987,6 @@ public:
                 V = std::vector<bool>(N,true);
                 for (int i = received_work.size() -1 ; i >=0 ; i--)
                 {
-                    // if(received_work[i].id == 23 and received_work[i].depth == 2)
-                        // std::cout << "received23" << std::endl;
                     work.push_front(received_work[i]);
                 }
                 for (int i = 0 ; i < parents.size() ; i++)
@@ -1057,8 +1028,6 @@ public:
             }
             if(new_no_backtracking_depth > last_no_backtrack_depth)
             {
-                // std::cout << rank << " dropping " << work.size() << " work" << std::endl;
-
                 work.clear();
                 parents.clear();
                 last_no_backtrack_depth = new_no_backtracking_depth;
@@ -1067,8 +1036,6 @@ public:
             {
                 if(rank < channel_no_backtracking.source())
                 {
-                    // std::cout << rank << " dropping " << work.size() << " work" << std::endl;
-
                     work.clear();
                     parents.clear();
                 }
@@ -1180,21 +1147,49 @@ public:
 
 };
 
-unsigned int get_initial_UB(const std::vector<task_t>& tasks )
-{
-    unsigned int UB = 0;
-    for(const auto& t : tasks)
-    {
-        if(t.deadline > UB)
-            UB = t.deadline;
-    }
+const auto comp_deadline_release = [ ]( const auto& lhs, const auto& rhs )
+                    {
+                            if(lhs.deadline == rhs.deadline)
+                            {
+                                return lhs.release > rhs.release;
 
-    UB += 1;
+                            }
+                            return lhs.deadline > rhs.deadline;
+                    };
 
-    return UB;
-}
+const auto comp_release_deadline = [ ]( const auto& lhs, const auto& rhs )
+                    {
+                            if(lhs.release == rhs.release)
+                            {
+                                return lhs.deadline > rhs.deadline;
 
-std::deque<task_node_t> get_initial_work(const std::vector<task_t>& tasks, int worldSize, int rank)
+                            }
+                            return lhs.release > rhs.release;
+                    };
+
+const auto comp_deadline_duration = [ ]( const auto& lhs, const auto& rhs )
+                    {
+                            if(lhs.deadline == rhs.deadline)
+                            {
+                                return lhs.duration < rhs.duration;
+
+                            }
+                            return lhs.deadline > rhs.deadline;
+                    };
+
+const auto comp_duration_deadline = [ ]( const auto& lhs, const auto& rhs )
+                    {
+                            if(lhs.duration == rhs.duration)
+                            {
+                                return lhs.deadline > rhs.deadline;
+
+                            }
+                            return lhs.duration < rhs.duration;
+                    };
+
+const std::vector<std::function<bool(const task_t &, const task_t &)>> comps = {comp_deadline_release, comp_release_deadline, comp_deadline_duration, comp_duration_deadline};
+
+std::deque<task_node_t> get_initial_work(std::vector<task_t>& tasks, int worldSize, int rank)
 {
     std::deque<task_node_t> work;
 
@@ -1226,15 +1221,19 @@ std::deque<task_node_t> get_initial_work(const std::vector<task_t>& tasks, int w
             my_initial_tasks_num += (N - worldSize*my_initial_tasks_num);
         }
     }
+    // if(my_initial_tasks_num > 1)
+        // std::sort(tasks.begin()+my_initial_task_id, tasks.begin()+my_initial_task_id+my_initial_tasks_num, comp_deadline_release);
+
     // std::cout << rank << " N "<< N << " my_initial_task_id " << my_initial_task_id << " last task id  " << (my_initial_task_id + my_initial_tasks_num -1)<< " my_initial_tasks_num "<< my_initial_tasks_num <<  std::endl;
 
     for (unsigned int i = my_initial_task_id; i < my_initial_task_id + my_initial_tasks_num; i++)
     {
-        work.emplace_back(tasks.at(i).id, tasks.at(i).duration + tasks.at(i).release, 0);
+        work.emplace_back(tasks.at(i).id, tasks.at(i).cost_lb, 0);
     }
 
     return work;
 }
+
 
 
 int main(int argc, char **argv)
@@ -1256,25 +1255,34 @@ int main(int argc, char **argv)
     if(rank == 0)
     {
         tasks = readInstance(argv[1]);
+        UB = validate(tasks);
+        if(UB == 0)
+        {
+            writeOutput(argv[2],{});
+            tasks.clear();
+        }
+
+        UB+=1;
 
         SHARE_DEPTH_LIMIT = tasks.size() > 5 ? ( tasks.size() - 5 ) : 0; //TODO: tune
 
-        UB = get_initial_UB(tasks);
         distributeInitialData(tasks, UB);
     }
     else
     {
         tie(tasks,UB) = receiveInitialData();
     }
-    tasks_unsorted = tasks;
-    
-    //TODO: sort bu chunks !!! also NOT SORT HERE, 
-    std::sort(tasks.begin(), tasks.end(), [ ]( const auto& lhs, const auto& rhs )
-                                            {
-                                                    return lhs.deadline > rhs.deadline;
-                                            });
+
+    if(tasks.empty())
+    {
+        MPI_Finalize();
+        exit(0);
+    }
 
     std::deque<task_node_t> work = get_initial_work(tasks, worldSize, rank);
+    tasks_unsorted = tasks;
+    
+    std::sort(tasks.begin(), tasks.end(), comps[rank%comps.size()]);
 
     Worker worker(rank, worldSize, tasks, tasks_unsorted, UB); //TODO tasks as reference 
 
